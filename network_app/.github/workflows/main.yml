@@ -29,38 +29,12 @@ jobs:
     - name: Get Flutter dependencies
       run: flutter pub get
 
-    - name: Verify Flutter installation
-      run: flutter doctor -v
-
     - name: Build APK (Release)
       run: flutter build apk --release
-
-    - name: List build outputs
-      run: |
-        echo "Build directory contents:"
-        ls -la build/app/outputs/flutter-apk/
-        echo "APK file details:"
-        file build/app/outputs/flutter-apk/app-release.apk
 
     - name: Upload APK artifact
       uses: actions/upload-artifact@v4
       with:
         name: flutter-apk-release
         path: build/app/outputs/flutter-apk/app-release.apk
-        retention-days: 30
-
-    - name: Generate build info
-      run: |
-        echo "## Build Information" > build-info.md
-        echo "- **Build Date**: $(date)" >> build-info.md
-        echo "- **Flutter Version**: $(flutter --version | head -n 1)" >> build-info.md
-        echo "- **Java Version**: $(java -version 2>&1 | head -n 1)" >> build-info.md
-        echo "- **APK Size**: $(du -h build/app/outputs/flutter-apk/app-release.apk | cut -f1)" >> build-info.md
-        echo "- **Commit**: ${{ github.sha }}" >> build-info.md
-
-    - name: Upload build info
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-info
-        path: build-info.md
         retention-days: 30
