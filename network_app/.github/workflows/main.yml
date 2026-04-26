@@ -17,7 +17,7 @@ jobs:
     - name: Set up Java
       uses: actions/setup-java@v4
       with:
-        distribution: 'zulu'
+        distribution: 'temurin'
         java-version: '17'
 
     - name: Set up Flutter
@@ -33,7 +33,7 @@ jobs:
       run: flutter doctor -v
 
     - name: Build APK (Release)
-      run: flutter build apk --release --verbose
+      run: flutter build apk --release
 
     - name: List build outputs
       run: |
