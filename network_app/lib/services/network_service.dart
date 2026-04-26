@@ -5,21 +5,29 @@ import 'package:nearby_connections/nearby_connections.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'logger_service.dart';
+import 'settings_service.dart';
 
 class NetworkService {
   static const String _serviceId = 'com.chimera.network_app';
-  static const String _deviceName = 'FileManager';
+  static const String _defaultDeviceName = 'FileManager';
   
   static final NetworkService _instance = NetworkService._internal();
   factory NetworkService() => _instance;
   NetworkService._internal();
 
+  final LoggerService _logger = LoggerService();
+  final SettingsService _settingsService = SettingsService();
+  
   bool _isAdvertising = false;
   bool _isDiscovering = false;
   List<String> _connectedDevices = [];
   Map<String, String> _deviceEndpoints = {};
+  Map<String, DateTime> _lastSeen = {};
   StreamSubscription? _connectionSubscription;
   StreamSubscription? _payloadSubscription;
+  Timer? _cleanupTimer;
+  Timer? _reconnectTimer;
 
   final StreamController<Map<String, dynamic>> _messageController = 
       StreamController<Map<String, dynamic>>.broadcast();
@@ -32,9 +40,16 @@ class NetworkService {
   List<String> get connectedDevices => List.unmodifiable(_connectedDevices);
 
   Future<void> initialize() async {
-    await _requestPermissions();
-    await _setupBackgroundService();
-    _setupEventListeners();
+    try {
+      await _requestPermissions();
+      await _setupBackgroundService();
+      _setupEventListeners();
+      _startCleanupTimer();
+      _logger.info('NetworkService initialized successfully');
+    } catch (e) {
+      _logger.error('Failed to initialize NetworkService', error: e);
+      rethrow;
+    }
   }
 
   Future<void> _requestPermissions() async {
@@ -48,10 +63,40 @@ class NetworkService {
     ];
 
     for (final permission in permissions) {
-      final status = await permission.request();
-      if (status.isDenied) {
-        print('Permission denied: ${permission.toString()}');
+      try {
+        final status = await permission.request();
+        if (status.isGranted) {
+          _logger.info('Permission granted: ${permission.toString()}');
+        } else if (status.isDenied) {
+          _logger.warning('Permission denied: ${permission.toString()}');
+        } else if (status.isPermanentlyDenied) {
+          _logger.error('Permission permanently denied: ${permission.toString()}');
+        }
+      } catch (e) {
+        _logger.error('Error requesting permission: ${permission.toString()}', error: e);
       }
+    }
+  }
+
+  void _startCleanupTimer() {
+    _cleanupTimer = Timer.periodic(const Duration(minutes: 5), (_) {
+      _cleanupStaleConnections();
+    });
+  }
+
+  void _cleanupStaleConnections() {
+    final now = DateTime.now();
+    final staleDevices = <String>[];
+    
+    for (final entry in _lastSeen.entries) {
+      if (now.difference(entry.value).inMinutes > 10) {
+        staleDevices.add(entry.key);
+      }
+    }
+    
+    for (final deviceId in staleDevices) {
+      _handleDisconnection(deviceId);
+      _logger.info('Cleaned up stale connection: $deviceId');
     }
   }
 
@@ -96,25 +141,31 @@ class NetworkService {
     if (_isAdvertising) return;
 
     try {
+      final deviceName = await _settingsService.getDeviceName();
       await Nearby().startAdvertising(
-        _deviceName,
+        deviceName,
         Strategy.P2P_CLUSTER,
         onConnectionInitiated: _onConnectionInitiated,
         onConnectionResult: (deviceId, status) {
           if (status == Status.connected) {
-            print('Connected to: $deviceId');
+            _logger.info('Successfully connected to: $deviceId');
+          } else if (status == Status.rejected) {
+            _logger.warning('Connection rejected by: $deviceId');
+          } else if (status == Status.error) {
+            _logger.error('Connection error with: $deviceId');
           }
         },
         onDisconnected: (deviceId) {
-          print('Disconnected from: $deviceId');
+          _logger.info('Disconnected from: $deviceId');
           _handleDisconnection(deviceId);
         },
         serviceId: _serviceId,
       );
       _isAdvertising = true;
-      print('Started advertising');
+      _logger.info('Started advertising as: $deviceName');
     } catch (e) {
-      print('Error starting advertising: $e');
+      _logger.error('Error starting advertising', error: e);
+      _scheduleReconnect();
     }
   }
 
@@ -126,18 +177,30 @@ class NetworkService {
         _serviceId,
         Strategy.P2P_CLUSTER,
         onEndpointFound: (deviceId, displayName, serviceId) {
-          print('Found device: $deviceId ($displayName)');
+          _logger.info('Found device: $deviceId ($displayName)');
           _requestConnection(deviceId);
         },
         onEndpointLost: (deviceId) {
-          print('Lost endpoint: $deviceId');
+          _logger.info('Lost endpoint: $deviceId');
         },
       );
       _isDiscovering = true;
-      print('Started discovery');
+      _logger.info('Started discovery');
     } catch (e) {
-      print('Error starting discovery: $e');
+      _logger.error('Error starting discovery', error: e);
+      _scheduleReconnect();
     }
+  }
+
+  void _scheduleReconnect() {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 5), () {
+      if (_isAdvertising || _isDiscovering) {
+        _logger.info('Attempting to reconnect network services');
+        if (_isAdvertising) startAdvertising();
+        if (_isDiscovering) startDiscovery();
+      }
+    });
   }
 
   Future<void> _requestConnection(String deviceId) async {
@@ -180,16 +243,18 @@ class NetworkService {
     if (!_connectedDevices.contains(deviceId)) {
       _connectedDevices.add(deviceId);
       _deviceEndpoints[deviceId] = info.endpointName;
+      _lastSeen[deviceId] = DateTime.now();
       _deviceListController.add(List.from(_connectedDevices));
-      print('Connected to device: $deviceId (${info.endpointName})');
+      _logger.info('Connected to device: $deviceId (${info.endpointName})');
     }
   }
 
   void _handleDisconnection(String deviceId) {
     _connectedDevices.remove(deviceId);
     _deviceEndpoints.remove(deviceId);
+    _lastSeen.remove(deviceId);
     _deviceListController.add(List.from(_connectedDevices));
-    print('Disconnected from device: $deviceId');
+    _logger.info('Disconnected from device: $deviceId');
   }
 
   void _handleMessage(String deviceId, Uint8List data) {
@@ -211,26 +276,47 @@ class NetworkService {
   }
 
   Future<void> sendMessage(String content, {String? targetDeviceId}) async {
-    final message = {
-      'type': 'message',
-      'content': content,
-      'senderId': Platform.isAndroid ? await _getDeviceId() : 'unknown',
-      'timestamp': DateTime.now().millisecondsSinceEpoch,
-      'ttl': 3, // Time to live for mesh routing
-    };
-
-    final messageData = Uint8List.fromList(json.encode(message).codeUnits);
-
-    if (targetDeviceId != null) {
-      // Send to specific device
-      if (_connectedDevices.contains(targetDeviceId)) {
-        await Nearby().sendBytesPayload(targetDeviceId, messageData);
+    try {
+      final maxHops = await _settingsService.getMaxHops();
+      final encryptionEnabled = await _settingsService.getEncryptionEnabled();
+      
+      var messageContent = content;
+      if (encryptionEnabled) {
+        final encryptionService = EncryptionService();
+        final sessionKey = encryptionService.generateSessionKey();
+        final encrypted = encryptionService.encryptMessage(messageContent, sessionKey);
+        messageContent = json.encode(encrypted);
       }
-    } else {
-      // Broadcast to all connected devices
-      for (final deviceId in _connectedDevices) {
-        await Nearby().sendBytesPayload(deviceId, messageData);
+
+      final message = {
+        'type': 'message',
+        'content': messageContent,
+        'senderId': Platform.isAndroid ? await _getDeviceId() : 'unknown',
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+        'ttl': maxHops, // Time to live for mesh routing
+        'encrypted': encryptionEnabled,
+      };
+
+      final messageData = Uint8List.fromList(json.encode(message).codeUnits);
+
+      if (targetDeviceId != null) {
+        // Send to specific device
+        if (_connectedDevices.contains(targetDeviceId)) {
+          await Nearby().sendBytesPayload(targetDeviceId, messageData);
+          _logger.info('Message sent to specific device: $targetDeviceId');
+        } else {
+          _logger.warning('Target device not connected: $targetDeviceId');
+        }
+      } else {
+        // Broadcast to all connected devices
+        for (final deviceId in _connectedDevices) {
+          await Nearby().sendBytesPayload(deviceId, messageData);
+        }
+        _logger.info('Message broadcast to ${_connectedDevices.length} devices');
       }
+    } catch (e) {
+      _logger.error('Failed to send message', error: e);
+      rethrow;
     }
   }
 
@@ -245,8 +331,13 @@ class NetworkService {
     // Forward to all connected devices except the sender
     for (final deviceId in _connectedDevices) {
       if (deviceId != senderId) {
-        final messageData = Uint8List.fromList(json.encode(forwardedMessage).codeUnits);
-        Nearby().sendBytesPayload(deviceId, messageData);
+        try {
+          final messageData = Uint8List.fromList(json.encode(forwardedMessage).codeUnits);
+          Nearby().sendBytesPayload(deviceId, messageData);
+          _logger.debug('Message forwarded to: $deviceId');
+        } catch (e) {
+          _logger.error('Failed to forward message to: $deviceId', error: e);
+        }
       }
     }
   }
